@@ -1,8 +1,9 @@
 services:
-  # Main web service
+  # Main web service - FREE TIER
   - type: web
     name: calendar-sync-api
     env: docker
+    plan: free
     dockerfilePath: ./Dockerfile
     envVars:
       - key: PORT
@@ -19,7 +20,3 @@ services:
         sync: false
       - key: BOOKING_PASSWORD
         sync: false
-    disk:
-      name: calendar-sync-data
-      mountPath: /app/data
-      sizeGB: 1
