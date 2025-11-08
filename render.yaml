@@ -12,6 +12,10 @@ services:
         value: 0.0.0.0
       - key: HEADLESS
         value: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: calendar-sync-db
+          property: connectionString
       - key: AIRBNB_EMAIL
         sync: false
       - key: AIRBNB_PASSWORD
@@ -20,3 +24,9 @@ services:
         sync: false
       - key: BOOKING_PASSWORD
         sync: false
+
+databases:
+  - name: calendar-sync-db
+    plan: free
+    databaseName: calendar_sync
+    user: calendar_sync_user

@@ -13,56 +13,18 @@ from pydantic import BaseModel, EmailStr
 from datetime import datetime, timedelta
 from typing import Optional, List
 import asyncio
-import sqlite3
 from pathlib import Path
 import json
 
 from email_parser import EmailParser, Booking
 from platform_blocker import PlatformBlocker
+from database import db
 
 
 app = FastAPI(title="Calendar Sync API")
 
-# Database setup
-DB_PATH = "calendar_sync.db"
-
-def init_db():
-    """Initialize SQLite database"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT NOT NULL,
-            checkin TEXT NOT NULL,
-            checkout TEXT NOT NULL,
-            property_id TEXT,
-            guest_name TEXT,
-            confirmation_code TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            blocked_on_other_platform INTEGER DEFAULT 0,
-            error_message TEXT
-        )
-    ''')
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS block_tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            booking_id INTEGER,
-            target_platform TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            completed_at TEXT,
-            error_message TEXT,
-            FOREIGN KEY (booking_id) REFERENCES bookings(id)
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-init_db()
+# Initialize database
+db.init_db()
 
 
 # Pydantic models
@@ -91,72 +53,92 @@ class BlockingStatus(BaseModel):
 
 
 # Background task processor
-async def process_blocking(booking_id: int, source_platform: str, 
+async def process_blocking(booking_id: int, source_platform: str,
                           checkin: datetime, checkout: datetime,
                           property_id: Optional[str] = None):
     """Background task to block dates on the other platform"""
-    
+
     # Determine target platform
     target_platform = 'booking' if source_platform == 'airbnb' else 'airbnb'
-    
+
     # Create task record
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO block_tasks (booking_id, target_platform, status)
-        VALUES (?, ?, 'processing')
-    ''', (booking_id, target_platform))
-    task_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    
+    with db.get_connection() as conn:
+        c = db.get_cursor(conn)
+        c.execute('''
+            INSERT INTO block_tasks (booking_id, target_platform, status)
+            VALUES (%s, %s, 'processing') RETURNING id
+        ''' if db.use_postgres else '''
+            INSERT INTO block_tasks (booking_id, target_platform, status)
+            VALUES (?, ?, 'processing')
+        ''', (booking_id, target_platform))
+
+        if db.use_postgres:
+            task_id = c.fetchone()['id']
+        else:
+            task_id = c.lastrowid
+        conn.commit()
+
     try:
         # Execute blocking
         blocker = PlatformBlocker()
         success = await blocker.block_dates(target_platform, checkin, checkout, property_id)
-        
+
         # Update database
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        if success:
-            c.execute('''
-                UPDATE block_tasks 
-                SET status='completed', completed_at=CURRENT_TIMESTAMP
-                WHERE id=?
-            ''', (task_id,))
-            
-            c.execute('''
-                UPDATE bookings 
-                SET blocked_on_other_platform=1
-                WHERE id=?
-            ''', (booking_id,))
-            
-            print(f"✓ Successfully blocked {target_platform} for booking {booking_id}")
-        else:
-            c.execute('''
-                UPDATE block_tasks 
-                SET status='failed', error_message='Blocking failed'
-                WHERE id=?
-            ''', (task_id,))
-            
-            print(f"✗ Failed to block {target_platform} for booking {booking_id}")
-        
-        conn.commit()
-        conn.close()
-        
+        with db.get_connection() as conn:
+            c = db.get_cursor(conn)
+
+            if success:
+                c.execute('''
+                    UPDATE block_tasks
+                    SET status='completed', completed_at=CURRENT_TIMESTAMP
+                    WHERE id=%s
+                ''' if db.use_postgres else '''
+                    UPDATE block_tasks
+                    SET status='completed', completed_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                ''', (task_id,))
+
+                c.execute('''
+                    UPDATE bookings
+                    SET blocked_on_other_platform=%s
+                    WHERE id=%s
+                ''' if db.use_postgres else '''
+                    UPDATE bookings
+                    SET blocked_on_other_platform=1
+                    WHERE id=?
+                ''', (True, booking_id) if db.use_postgres else (booking_id,))
+
+                print(f"✓ Successfully blocked {target_platform} for booking {booking_id}")
+            else:
+                c.execute('''
+                    UPDATE block_tasks
+                    SET status='failed', error_message='Blocking failed'
+                    WHERE id=%s
+                ''' if db.use_postgres else '''
+                    UPDATE block_tasks
+                    SET status='failed', error_message='Blocking failed'
+                    WHERE id=?
+                ''', (task_id,))
+
+                print(f"✗ Failed to block {target_platform} for booking {booking_id}")
+
+            conn.commit()
+
     except Exception as e:
         # Log error
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''
-            UPDATE block_tasks 
-            SET status='failed', error_message=?
-            WHERE id=?
-        ''', (str(e), task_id))
-        conn.commit()
-        conn.close()
-        
+        with db.get_connection() as conn:
+            c = db.get_cursor(conn)
+            c.execute('''
+                UPDATE block_tasks
+                SET status='failed', error_message=%s
+                WHERE id=%s
+            ''' if db.use_postgres else '''
+                UPDATE block_tasks
+                SET status='failed', error_message=?
+                WHERE id=?
+            ''', (str(e), task_id))
+            conn.commit()
+
         print(f"✗ Error blocking {target_platform}: {e}")
 
 
@@ -168,34 +150,41 @@ async def email_webhook(request: EmailWebhookRequest, background_tasks: Backgrou
     Webhook endpoint for incoming booking confirmation emails
     Mailgun, SendGrid, or custom email forwarder hits this endpoint
     """
-    
+
     parser = EmailParser()
-    
+
     # Parse the email
     booking = parser.parse_email(request.body_text, request.subject)
-    
+
     if not booking:
         raise HTTPException(status_code=400, detail="Could not parse booking from email")
-    
+
     # Store in database
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO bookings 
-        (platform, checkin, checkout, property_id, guest_name, confirmation_code)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (
-        booking.platform,
-        booking.checkin.isoformat(),
-        booking.checkout.isoformat(),
-        booking.property_id,
-        booking.guest_name,
-        booking.confirmation_code
-    ))
-    booking_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    
+    with db.get_connection() as conn:
+        c = db.get_cursor(conn)
+        c.execute('''
+            INSERT INTO bookings
+            (platform, checkin, checkout, property_id, guest_name, confirmation_code)
+            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+        ''' if db.use_postgres else '''
+            INSERT INTO bookings
+            (platform, checkin, checkout, property_id, guest_name, confirmation_code)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            booking.platform,
+            booking.checkin.isoformat(),
+            booking.checkout.isoformat(),
+            booking.property_id,
+            booking.guest_name,
+            booking.confirmation_code
+        ))
+
+        if db.use_postgres:
+            booking_id = c.fetchone()['id']
+        else:
+            booking_id = c.lastrowid
+        conn.commit()
+
     # Queue blocking task
     background_tasks.add_task(
         process_blocking,
@@ -205,7 +194,7 @@ async def email_webhook(request: EmailWebhookRequest, background_tasks: Backgrou
         booking.checkout,
         booking.property_id
     )
-    
+
     return {
         "status": "success",
         "booking_id": booking_id,
@@ -219,26 +208,36 @@ async def manual_block(request: ManualBlockRequest, background_tasks: Background
     Manual blocking endpoint for walk-ins
     Blocks dates on both platforms
     """
-    
+
     tasks = []
-    
+
     if request.block_airbnb:
         # Create dummy booking for Airbnb
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO bookings 
-            (platform, checkin, checkout, property_id, guest_name, confirmation_code)
-            VALUES ('manual', ?, ?, ?, 'Walk-in', 'MANUAL')
-        ''', (
-            request.checkin.isoformat(),
-            request.checkout.isoformat(),
-            request.property_id
-        ))
-        booking_id = c.lastrowid
-        conn.commit()
-        conn.close()
-        
+        with db.get_connection() as conn:
+            c = db.get_cursor(conn)
+            c.execute('''
+                INSERT INTO bookings
+                (platform, checkin, checkout, property_id, guest_name, confirmation_code)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            ''' if db.use_postgres else '''
+                INSERT INTO bookings
+                (platform, checkin, checkout, property_id, guest_name, confirmation_code)
+                VALUES (?, ?, ?, ?, 'Walk-in', 'MANUAL')
+            ''', (
+                'manual',
+                request.checkin.isoformat(),
+                request.checkout.isoformat(),
+                request.property_id,
+                'Walk-in',
+                'MANUAL'
+            ))
+
+            if db.use_postgres:
+                booking_id = c.fetchone()['id']
+            else:
+                booking_id = c.lastrowid
+            conn.commit()
+
         background_tasks.add_task(
             process_blocking,
             booking_id,
@@ -247,7 +246,7 @@ async def manual_block(request: ManualBlockRequest, background_tasks: Background
             request.checkout,
             request.property_id
         )
-        
+
         # Queue Airbnb blocking
         blocker = PlatformBlocker()
         background_tasks.add_task(
@@ -258,7 +257,7 @@ async def manual_block(request: ManualBlockRequest, background_tasks: Background
             request.property_id
         )
         tasks.append('airbnb')
-    
+
     if request.block_booking:
         # Queue Booking.com blocking
         blocker = PlatformBlocker()
@@ -270,7 +269,7 @@ async def manual_block(request: ManualBlockRequest, background_tasks: Background
             request.property_id
         )
         tasks.append('booking')
-    
+
     return {
         "status": "success",
         "message": f"Blocking dates on: {', '.join(tasks)}",
@@ -282,76 +281,123 @@ async def manual_block(request: ManualBlockRequest, background_tasks: Background
 @app.get("/api/bookings")
 async def list_bookings(limit: int = 50, offset: int = 0):
     """List recent bookings and their blocking status"""
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        SELECT 
-            id, platform, checkin, checkout, 
-            property_id, guest_name, confirmation_code,
-            blocked_on_other_platform, error_message, created_at
-        FROM bookings
-        ORDER BY created_at DESC
-        LIMIT ? OFFSET ?
-    ''', (limit, offset))
-    
-    bookings = []
-    for row in c.fetchall():
-        bookings.append({
-            'id': row[0],
-            'platform': row[1],
-            'checkin': row[2],
-            'checkout': row[3],
-            'property_id': row[4],
-            'guest_name': row[5],
-            'confirmation_code': row[6],
-            'blocked_on_other': bool(row[7]),
-            'error': row[8],
-            'created_at': row[9]
-        })
-    
-    conn.close()
+
+    with db.get_connection() as conn:
+        c = db.get_cursor(conn)
+        c.execute('''
+            SELECT
+                id, platform, checkin, checkout,
+                property_id, guest_name, confirmation_code,
+                blocked_on_other_platform, error_message, created_at
+            FROM bookings
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        ''' if db.use_postgres else '''
+            SELECT
+                id, platform, checkin, checkout,
+                property_id, guest_name, confirmation_code,
+                blocked_on_other_platform, error_message, created_at
+            FROM bookings
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        ''', (limit, offset))
+
+        bookings = []
+        for row in c.fetchall():
+            if db.use_postgres:
+                bookings.append({
+                    'id': row['id'],
+                    'platform': row['platform'],
+                    'checkin': row['checkin'],
+                    'checkout': row['checkout'],
+                    'property_id': row['property_id'],
+                    'guest_name': row['guest_name'],
+                    'confirmation_code': row['confirmation_code'],
+                    'blocked_on_other': bool(row['blocked_on_other_platform']),
+                    'error': row['error_message'],
+                    'created_at': str(row['created_at'])
+                })
+            else:
+                bookings.append({
+                    'id': row[0],
+                    'platform': row[1],
+                    'checkin': row[2],
+                    'checkout': row[3],
+                    'property_id': row[4],
+                    'guest_name': row[5],
+                    'confirmation_code': row[6],
+                    'blocked_on_other': bool(row[7]),
+                    'error': row[8],
+                    'created_at': row[9]
+                })
+
     return {"bookings": bookings}
 
 
 @app.get("/api/status/{booking_id}")
 async def booking_status(booking_id: int):
     """Check blocking status for a specific booking"""
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Get booking
-    c.execute('SELECT * FROM bookings WHERE id=?', (booking_id,))
-    booking_row = c.fetchone()
-    
-    if not booking_row:
-        raise HTTPException(status_code=404, detail="Booking not found")
-    
-    # Get tasks
-    c.execute('SELECT * FROM block_tasks WHERE booking_id=?', (booking_id,))
-    task_rows = c.fetchall()
-    
-    conn.close()
-    
-    return {
-        'booking_id': booking_id,
-        'platform': booking_row[1],
-        'checkin': booking_row[2],
-        'checkout': booking_row[3],
-        'blocked_on_other': bool(booking_row[7]),
-        'tasks': [
-            {
-                'id': row[0],
-                'target_platform': row[2],
-                'status': row[3],
-                'created_at': row[4],
-                'completed_at': row[5],
-                'error': row[6]
-            }
-            for row in task_rows
-        ]
-    }
+
+    with db.get_connection() as conn:
+        c = db.get_cursor(conn)
+
+        # Get booking
+        c.execute('''
+            SELECT * FROM bookings WHERE id=%s
+        ''' if db.use_postgres else '''
+            SELECT * FROM bookings WHERE id=?
+        ''', (booking_id,))
+        booking_row = c.fetchone()
+
+        if not booking_row:
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        # Get tasks
+        c.execute('''
+            SELECT * FROM block_tasks WHERE booking_id=%s
+        ''' if db.use_postgres else '''
+            SELECT * FROM block_tasks WHERE booking_id=?
+        ''', (booking_id,))
+        task_rows = c.fetchall()
+
+    if db.use_postgres:
+        return {
+            'booking_id': booking_id,
+            'platform': booking_row['platform'],
+            'checkin': booking_row['checkin'],
+            'checkout': booking_row['checkout'],
+            'blocked_on_other': bool(booking_row['blocked_on_other_platform']),
+            'tasks': [
+                {
+                    'id': row['id'],
+                    'target_platform': row['target_platform'],
+                    'status': row['status'],
+                    'created_at': str(row['created_at']),
+                    'completed_at': str(row['completed_at']) if row['completed_at'] else None,
+                    'error': row['error_message']
+                }
+                for row in task_rows
+            ]
+        }
+    else:
+        return {
+            'booking_id': booking_id,
+            'platform': booking_row[1],
+            'checkin': booking_row[2],
+            'checkout': booking_row[3],
+            'blocked_on_other': bool(booking_row[7]),
+            'tasks': [
+                {
+                    'id': row[0],
+                    'target_platform': row[2],
+                    'status': row[3],
+                    'created_at': row[4],
+                    'completed_at': row[5],
+                    'error': row[6]
+                }
+                for row in task_rows
+            ]
+        }
 
 
 @app.get("/", response_class=HTMLResponse)

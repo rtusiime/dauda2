@@ -4,6 +4,9 @@ playwright==1.40.0
 pydantic==2.5.0
 python-multipart==0.0.6
 
+# Database
+psycopg2-binary==2.9.9
+
 # Optional: for production
 gunicorn==21.2.0
 redis==5.0.1
