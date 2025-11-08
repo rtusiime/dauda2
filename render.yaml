@@ -1,0 +1,25 @@
+services:
+  # Main web service
+  - type: web
+    name: calendar-sync-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: HOST
+        value: 0.0.0.0
+      - key: HEADLESS
+        value: true
+      - key: AIRBNB_EMAIL
+        sync: false
+      - key: AIRBNB_PASSWORD
+        sync: false
+      - key: BOOKING_EMAIL
+        sync: false
+      - key: BOOKING_PASSWORD
+        sync: false
+    disk:
+      name: calendar-sync-data
+      mountPath: /app/data
+      sizeGB: 1

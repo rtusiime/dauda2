@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  calendar-sync:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro
+      - ./calendar_sync.db:/app/calendar_sync.db
+    environment:
+      - HEADLESS=true
+      - AIRBNB_EMAIL=${AIRBNB_EMAIL}
+      - AIRBNB_PASSWORD=${AIRBNB_PASSWORD}
+      - BOOKING_EMAIL=${BOOKING_EMAIL}
+      - BOOKING_PASSWORD=${BOOKING_PASSWORD}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/bookings"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Redis for task queue (if scaling up)
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped
